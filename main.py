@@ -11,60 +11,62 @@ The local weekly_report_fill.py calls these endpoints and writes
 the returned data into the Excel sheet.
 """
 
+import asyncio
 import logging
 import os
-from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from playwright.async_api import async_playwright, Browser, BrowserContext
-import asyncio
-import json
+from playwright.sync_api import sync_playwright
 
-from scraper import scrape_nse_ebp, scrape_bse_bonds
+from scraper import scrape_nse_ebp, scrape_bse_bonds, _make_browser_context
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Browser lifecycle — one browser per Cloud Run instance ────────────────────
 
-_browser: Browser | None = None
-_playwright = None
+# ── Sync scrape helpers (run in thread executor) ───────────────────────────────
+
+def _sync_nse(from_date, to_date):
+    with sync_playwright() as pw:
+        browser, ctx = _make_browser_context(pw)
+        page = ctx.new_page()
+        try:
+            return scrape_nse_ebp(page, from_date, to_date)
+        finally:
+            page.close()
+            ctx.close()
+            browser.close()
 
 
-async def get_context() -> BrowserContext:
-    """
-    Launch Chromium with anti-detection settings.
-    NSE India blocks standard headless mode, so we use headless=False with
-    Xvfb (virtual display) — the Dockerfile sets DISPLAY=:99 via Xvfb.
-    """
-    global _browser, _playwright
-    if _browser is None or not _browser.is_connected():
-        _playwright = await async_playwright().start()
-        _browser = await _playwright.chromium.launch(
-            headless=False,   # NSE blocks headless — Xvfb provides virtual display
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        log.info("Chromium launched")
-    ctx = await _browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1280, "height": 800},
-    )
-    await ctx.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
-    return ctx
+def _sync_bse(from_date, to_date):
+    with sync_playwright() as pw:
+        browser, ctx = _make_browser_context(pw)
+        page = ctx.new_page()
+        try:
+            return scrape_bse_bonds(page, from_date, to_date)
+        finally:
+            page.close()
+            ctx.close()
+            browser.close()
+
+
+def _sync_all(from_date, to_date):
+    with sync_playwright() as pw:
+        browser, ctx = _make_browser_context(pw)
+        try:
+            page_nse = ctx.new_page()
+            nse_data = scrape_nse_ebp(page_nse, from_date, to_date)
+            page_nse.close()
+
+            page_bse = ctx.new_page()
+            bse_data = scrape_bse_bonds(page_bse, from_date, to_date)
+            page_bse.close()
+        finally:
+            ctx.close()
+            browser.close()
+    return nse_data, bse_data
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -82,15 +84,9 @@ async def nse_ebp(
     from_date: str | None = Query(None, alias="from", description="YYYY-MM-DD"),
     to_date:   str | None = Query(None, alias="to",   description="YYYY-MM-DD"),
 ):
-    """Scrape NSE EBP placement reporting. Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD."""
     try:
-        ctx  = await get_context()
-        page = await ctx.new_page()
-        loop    = asyncio.get_event_loop()
-        records = await loop.run_in_executor(
-            None, scrape_nse_ebp, page, from_date, to_date)
-        await page.close()
-        await ctx.close()
+        loop    = asyncio.get_running_loop()
+        records = await loop.run_in_executor(None, _sync_nse, from_date, to_date)
         log.info("/nse-ebp → %d records", len(records))
         return {"source": "NSE EBP", "count": len(records), "records": records}
     except Exception as exc:
@@ -103,15 +99,9 @@ async def bse_bonds(
     from_date: str | None = Query(None, alias="from", description="YYYY-MM-DD"),
     to_date:   str | None = Query(None, alias="to",   description="YYYY-MM-DD"),
 ):
-    """Scrape BSE bond issuances. Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD."""
     try:
-        ctx  = await get_context()
-        page = await ctx.new_page()
-        loop    = asyncio.get_event_loop()
-        records = await loop.run_in_executor(
-            None, scrape_bse_bonds, page, from_date, to_date)
-        await page.close()
-        await ctx.close()
+        loop    = asyncio.get_running_loop()
+        records = await loop.run_in_executor(None, _sync_bse, from_date, to_date)
         log.info("/bse-bonds → %d records", len(records))
         return {"source": "BSE Bonds", "count": len(records), "records": records}
     except Exception as exc:
@@ -124,21 +114,10 @@ async def all_data(
     from_date: str | None = Query(None, alias="from", description="YYYY-MM-DD"),
     to_date:   str | None = Query(None, alias="to",   description="YYYY-MM-DD"),
 ):
-    """Scrape both NSE and BSE in parallel. Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD."""
     try:
-        ctx_nse, ctx_bse = await asyncio.gather(get_context(), get_context())
-        page_nse = await ctx_nse.new_page()
-        page_bse = await ctx_bse.new_page()
-
-        loop = asyncio.get_event_loop()
-        nse_task = loop.run_in_executor(
-            None, scrape_nse_ebp, page_nse, from_date, to_date)
-        bse_task = loop.run_in_executor(
-            None, scrape_bse_bonds, page_bse, from_date, to_date)
-        nse_data, bse_data = await asyncio.gather(nse_task, bse_task)
-
-        await asyncio.gather(page_nse.close(), page_bse.close(),
-                             ctx_nse.close(), ctx_bse.close())
+        loop = asyncio.get_running_loop()
+        nse_data, bse_data = await loop.run_in_executor(
+            None, _sync_all, from_date, to_date)
         return {
             "nse": {"count": len(nse_data), "records": nse_data},
             "bse": {"count": len(bse_data), "records": bse_data},
